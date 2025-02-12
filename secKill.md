@@ -403,6 +403,10 @@ spec:
 
 # 自动扩缩容
 
+## HPA
+
+背景：传统的副本控制器只能将容器副本数量控制在既定目标上,  虽然可以通过命令手动调整副本数量，但是应对突发流量时往往来不及手动调整载荷，高峰褪去时也不能及时释放资源，因此容器副本的自动伸缩具有重要意义，而HPA可以实现自动化的容器副本数量伸缩，HPA是pod水平自动伸缩资源的缩写，HPA资源可以监控副本控制器关联容器的平均载荷情况，并根据设定的阈值动态地伸缩容器副本数量从而实现自动扩容应对突发流量，自动缩容来及时释放系统资源提高资源利用率，实际操作很简单主要是定义副本伸缩范围以及关联副本控制器以及容器负载阈值
+
 ```yml
 apiVersion: autoscaling/v2beta2
 kind: HorizontalPodAutoscaler
@@ -431,5 +435,133 @@ spec:
         averageValue: 200Mi # 目标内存平均使用量为200 MiB
 ```
 
-## Cluster Autosca //todo
+## Cluster Autoscaler
 
+- **背景**
+
+  HPA虽然可以提供容器副本的自动扩缩容机制，但前提是K8S系统有足够的资源冗余，如果K8S系统整体资源不足HPA就会扩容失败从而不发应对突发流量，所以理论上要实现真正的自动伸缩以应对突发流量仅靠pod的自动扩容还不够，还需要K8S集群级别的自动扩容支持才可以，而Cluster Autoscaler就是实现集群自动扩展的重要工具，大概得工作原理是持续监控集群资源使用情况如CPU和内存, 当发现资源不足的时候就向公有云借力，具体来说就是临时向公有云租借短期服务器并加入当前集群从而打破系统性能边界实现自动化的水平扩缩容，以下是具体实施过程
+
+- **前提条件**
+  - 已有一个运行中的 Kubernetes 集群：确保你的集群已经部署在阿里云上，并且可以通过 kubectl 命令行工具进行管理
+  - 阿里云账号：拥有一个有效的阿里云账号，并且有足够的权限来创建和管理 ECS 实例
+  - 安装 kubectl 和 helm：确保你已经安装了 kubectl 和 helm 工具
+
+- **步骤 1：准备阿里云资源**
+
+  - 创建专有网络VPC和交换机VSwitch，如果你还没有 VPC 和 VSwitch，请先创建它们
+    - 登录 阿里云控制台
+    - 进入 专有网络 VPC 页面，创建一个新的 VPC
+    - 在该 VPC 下创建一个或多个交换机（VSwitch），并选择合适的可用区
+  - 创建安全组，确保你有一个安全组，允许 Kubernetes 节点之间的通信以及与外部服务的通信
+    - 在阿里云控制台中，进入 安全组 页面，创建一个新的安全组
+    - 添加规则允许必要的端口（如 6443、10250 等）
+
+- **步骤 2：配置弹性伸缩组**（Elastic Scaling Group, ESG）
+
+  阿里云提供了 弹性伸缩组 来动态管理 ECS 实例。你需要为 Kubernetes 集群创建一个弹性伸缩组，并将其与 Cluster Autoscaler 关联
+
+  1. 创建弹性伸缩组
+     1. 登录阿里云控制台，进入 弹性伸缩 页面。
+     2. 点击 创建伸缩组，填写相关信息：
+        1. 伸缩组名称：自定义名称。
+        2. 最小实例数：设置为 0 或者你希望的最小实例数。
+        3. 最大实例数：设置为你希望的最大实例数。
+        4. VPC 和 VSwitch：选择之前创建的 VPC 和 VSwitch。
+        5. 负载均衡器：如果需要，可以关联负载均衡器。
+        6. 安全组：选择之前创建的安全组。
+     3. 完成创建后，记下伸缩组的 ID。
+  2. 创建启动模板（Launch Template）,启动模板定义了每个 ECS 实例的配置，包括镜像、规格、存储等。
+     1. 在阿里云控制台中，进入 启动模板 页面，点击 创建启动模板。
+     2. 填写相关信息：
+        1. 模板名称：自定义名称。
+        2. 镜像：选择适合的 Kubernetes 节点镜像（通常是官方提供的 Kubernetes 镜像）。
+        3. 实例规格：选择适合的 ECS 规格（如 ecs.g6.large）。
+        4. 系统盘和数据盘：根据需求配置。
+        5. 安全组：选择之前创建的安全组。
+        6. 密钥对：选择用于 SSH 访问的密钥对。
+        7. 用户数据脚本：添加用户数据脚本，以便在 ECS 实例启动时自动加入 Kubernetes 集群。你可以参考阿里云文档中的示例脚本。
+     3. 完成创建后，记下启动模板的 ID。
+  3. 将启动模板与伸缩组关联
+     1. 回到 弹性伸缩组 页面，找到你刚刚创建的伸缩组。
+     2. 在伸缩组详情页面，点击 实例配置来源，选择 启动模板，然后选择你创建的启动模板
+
+- **步骤 3：部署 Cluster Autoscaler**
+
+  Cluster Autoscaler 是一个 Kubernetes 插件，它会监控集群的资源使用情况，并根据需要自动扩展或缩减节点。
+
+  1. 安装 Cluster Autoscaler,你可以通过 Helm 或手动方式安装 Cluster Autoscaler。	
+
+     使用 Helm 安装
+
+     1. 添加阿里云的 Helm 仓库：
+
+        ```linux
+        helm repo add ack https://apphub.aliyuncs.com
+        helm repo update
+        ```
+
+     2. 安装 Cluster Autoscaler
+
+        ```
+        helm install cluster-autoscaler ack/cluster-autoscaler \
+          --set autoDiscovery.clusterName=<your-cluster-name> \  #是你的 Kubernetes 集群名称。
+          --set cloudProvider=ack \
+          --set awsRegion=<your-region> \
+          --set groups[0].maxSize=<max-size> \ #是你希望的节点数量范围。
+          --set groups[0].minSize=<min-size> \ #是你希望的节点数量范围。
+          --set groups[0].id=<your-scaling-group-id> #是你在阿里云上创建的弹性伸缩组的 ID。
+        ```
+
+- **步骤 4：验证 Cluster Autoscaler 工作状态**
+
+  1. 检查日志,你可以通过查看 Cluster Autoscaler 的日志来确认其是否正常工作：
+
+     ```
+     kubectl logs -n kube-system deployment/cluster-autoscaler
+     ```
+
+  2. 创建测试 Pod,为了测试 Cluster Autoscaler 是否能够正确扩展节点，你可以创建一些需要大量资源的 Pod：
+
+     ```
+     apiVersion: v1
+     kind: Pod
+     metadata:
+       name: resource-intensive-pod
+     spec:
+       containers:
+         - name: main
+           image: nginx
+           resources:
+             requests:
+               cpu: "1"
+               memory: "2Gi"
+             limits:
+               cpu: "1"
+               memory: "2Gi"
+     ```
+
+  3. 将上述 YAML 文件保存为 test-pod.yaml，然后执行以下命令来创建 Pod：
+
+     ```
+     kubectl apply -f test-pod.yaml
+     ```
+
+  4. 观察集群中的节点数量是否增加，以验证 Cluster Autoscaler 是否正常工作。
+
+- **步骤 5：清理资源,当不再需要临时租借的服务器时，Cluster Autoscaler 会自动缩减节点。你也可以手动删除不需要的资源：**
+
+  1. 删除测试 Pod：
+
+     ```
+     kubectl delete -f test-pod.yaml
+     ```
+
+  2. 如果不再需要 Cluster Autoscaler，可以通过以下命令卸载它：
+
+     ```
+     helm uninstall cluster-autoscaler
+     ```
+
+  3. 在阿里云控制台上删除弹性伸缩组和相关资源。
+
+- **补充说明：**Cluster Autoscaler 的主要工作原理是监控集群中 Pod 的调度状态。当有 Pod 因为资源不足而无法调度（即处于 pending 状态）时，Cluster Autoscaler 会自动扩展节点以满足这些 Pod 的资源需求, 所以只需要配置节点伸缩量即可
